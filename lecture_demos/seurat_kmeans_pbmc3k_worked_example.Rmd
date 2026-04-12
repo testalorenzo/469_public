@@ -1,0 +1,274 @@
+---
+title: "Leaving Seurat and Coming Back: PBMC 3K with k-means"
+output:
+  html_document: default
+  pdf_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup-knitr, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Why move in and out of Seurat?
+
+Seurat is convenient for standard single-cell preprocessing steps such as quality control, normalization, and highly variable gene selection. But a Seurat object is still an R object, so we can pull out a matrix, try another method in ordinary R, and then bring the results back into Seurat for plotting. In this notebook we will follow the [PBMC 3K Seurat tutorial](https://satijalab.org/seurat/articles/pbmc3k_tutorial.html) through highly variable gene selection, perform clustering outside Seurat, and then use Seurat again to visualize the result on a UMAP.
+
+> Note: Older Seurat examples often use slot syntax such as `pbmc@assays$RNA@counts` or `pbmc@assays$RNA@data`. In this notebook we use the Seurat v5-style accessors from the current PBMC tutorial: `pbmc[["RNA"]]$counts` and `pbmc[["RNA"]]$data`.
+
+# Setup
+
+## Load packages
+
+```{r package-checks}
+required_packages <- c("Seurat", "Matrix", "dplyr")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install_commands <- paste0('install.packages("', missing_packages, '")', collapse = "\n")
+  stop(
+    paste0(
+      "Please install the missing package(s) before knitting this notebook: ",
+      paste(missing_packages, collapse = ", "),
+      "\n\nRun:\n",
+      install_commands
+    ),
+    call. = FALSE
+  )
+}
+
+library(Seurat)
+library(Matrix)
+library(dplyr)
+```
+
+## Download and unpack the PBMC 3K data
+
+```{r download-pbmc}
+pbmc_root <- file.path("data", "pbmc3k")
+dir.create(pbmc_root, recursive = TRUE, showWarnings = FALSE)
+
+pbmc_tarball <- file.path(pbmc_root, "pbmc3k_filtered_gene_bc_matrices.tar.gz")
+
+candidate_urls <- c(
+  "https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz",
+  "https://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz"
+)
+
+if (!file.exists(pbmc_tarball)) {
+  download_ok <- FALSE
+
+  for (candidate_url in candidate_urls) {
+    try({
+      download.file(
+        url = candidate_url,
+        destfile = pbmc_tarball,
+        mode = "wb",
+        quiet = TRUE
+      )
+
+      download_ok <- file.exists(pbmc_tarball) && file.info(pbmc_tarball)$size > 0
+    }, silent = TRUE)
+
+    if (download_ok) {
+      break
+    }
+  }
+
+  if (!download_ok) {
+    stop("Could not download the PBMC 3K dataset from the candidate 10x Genomics URLs.")
+  }
+}
+
+matrix_files <- list.files(
+  pbmc_root,
+  pattern = "^matrix\\.mtx(\\.gz)?$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(matrix_files) == 0) {
+  untar(pbmc_tarball, exdir = pbmc_root)
+
+  matrix_files <- list.files(
+    pbmc_root,
+    pattern = "^matrix\\.mtx(\\.gz)?$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+}
+
+if (length(matrix_files) == 0) {
+  stop("Could not find a matrix.mtx file after unpacking the PBMC 3K tarball.")
+}
+
+pbmc_data_dir <- dirname(matrix_files[1])
+pbmc_data_dir
+```
+
+# Seurat preprocessing
+
+## Read the 10X matrix and create a Seurat object
+
+```{r create-seurat-object}
+pbmc.data <- Read10X(data.dir = pbmc_data_dir)
+
+pbmc <- CreateSeuratObject(
+  counts = pbmc.data,
+  project = "pbmc3k",
+  min.cells = 3,
+  min.features = 200
+)
+
+pbmc
+```
+
+## Compute simple QC metrics
+
+```{r qc-metrics}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+head(pbmc[[]], 5)
+```
+
+```{r qc-plot, fig.width=8, fig.height=4}
+VlnPlot(
+  pbmc,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3
+)
+```
+
+## Filter cells, normalize, and find highly variable genes
+
+```{r preprocess}
+pbmc <- subset(
+  pbmc,
+  subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5
+)
+
+pbmc <- NormalizeData(
+  pbmc,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000
+)
+
+pbmc <- FindVariableFeatures(
+  pbmc,
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+hvg_genes <- VariableFeatures(pbmc)
+
+length(hvg_genes)
+head(hvg_genes, 10)
+```
+
+```{r variable-feature-plot, fig.width=8, fig.height=4}
+top10 <- head(hvg_genes, 10)
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+# Leave Seurat: extract the matrix for another method
+
+At this point, the Seurat object contains both raw counts and normalized values. The current PBMC tutorial stores:
+
+- raw counts in `pbmc[["RNA"]]$counts`
+- normalized values in `pbmc[["RNA"]]$data`
+- highly variable genes in `VariableFeatures(pbmc)`
+
+We will extract the normalized expression matrix for the highly variable genes and then make a deliberately simple choice outside Seurat: run `kmeans()` directly on those genes.
+
+```{r inspect-seurat-storage}
+dim(pbmc[["RNA"]]$counts)
+dim(pbmc[["RNA"]]$data)
+
+pbmc[["RNA"]]$counts[1:5, 1:5]
+pbmc[["RNA"]]$data[1:5, 1:5]
+```
+
+```{r extract-hvg-matrix}
+hvg_mat <- as.matrix(pbmc[["RNA"]]$data[hvg_genes, ])
+
+dim(hvg_mat)
+class(hvg_mat)
+
+stopifnot(length(hvg_genes) > 0)
+stopifnot(nrow(hvg_mat) == length(hvg_genes))
+stopifnot(ncol(hvg_mat) == ncol(pbmc))
+```
+
+`hvg_mat` has genes as rows and cells as columns. The `kmeans()` function expects observations in rows, so we transpose the matrix before clustering.
+
+```{r transpose-for-kmeans}
+cell_hvg_mat <- t(hvg_mat)
+
+dim(cell_hvg_mat)
+
+stopifnot(nrow(cell_hvg_mat) == ncol(pbmc))
+stopifnot(ncol(cell_hvg_mat) == length(hvg_genes))
+```
+
+# Perform clustering outside Seurat
+
+This is not meant to be the best clustering strategy. We are using it because it is easy to understand and because it shows how to leave the Seurat workflow, try something in base R, and then return to Seurat for visualization. Here we run `kmeans()` directly on a high-dimensional matrix of highly variable genes.
+
+```{r run-kmeans}
+set.seed(1234)
+
+km_res <- kmeans(
+  x = cell_hvg_mat,
+  centers = 5,
+  nstart = 20
+)
+
+str(km_res, max.level = 1)
+```
+
+```{r inspect-kmeans}
+head(km_res$cluster)
+table(km_res$cluster)
+```
+
+`km_res` is an ordinary R object returned by `kmeans()`, not a Seurat object.
+
+# Return to Seurat
+
+Now we add the k-means cluster labels back into Seurat metadata and use Seurat to build a UMAP for plotting.
+
+```{r add-kmeans-clusters}
+pbmc$kmeans_cluster <- factor(km_res$cluster)
+
+dplyr::count(pbmc[[]], kmeans_cluster, sort = TRUE)
+```
+
+```{r seurat-embedding}
+set.seed(1234)
+
+pbmc <- ScaleData(pbmc, features = hvg_genes, verbose = FALSE)
+pbmc <- RunPCA(pbmc, features = hvg_genes, verbose = FALSE)
+pbmc <- RunUMAP(pbmc, reduction = "pca", dims = 1:10, verbose = FALSE)
+```
+
+```{r kmeans-umap, fig.width=7, fig.height=5}
+DimPlot(pbmc, group.by = "kmeans_cluster", label = TRUE) +
+  ggplot2::ggtitle("UMAP colored by k-means clusters")
+```
+
+# Your turn
+
+This notebook stops before the "best" clustering method on purpose. Use it as a starting point and answer these questions on your own:
+
+1. What changes when you increase or decrease the number of k-means clusters?
+2. Why might direct k-means on the highly variable gene matrix be a poor choice for scRNA-seq data?
+3. If you wanted to improve this analysis while still leaving Seurat, what would you try next?
